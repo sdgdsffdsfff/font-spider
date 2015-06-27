@@ -5,16 +5,41 @@ var path = require('path');
 var util = require('util');
 var events = require('events');
 
+var Promise = require('promise');
 var glob = require('glob');
+var Font = require('./font.js');
 var Spider = require('./spider.js');
-var Optimizer = require('./optimizer.js');
-var Convertor = require('./convertor.js');
+var ColorConsole = require('./color-console.js');
+var version = require('../package.json').version;
+
+// http://font-spider.org/css/style.css
+//var RE_SERVER = /^(\/|http\:|https\:)/i;
+var RE_SERVER = /^(http\:|https\:)/i;
 
 
 
 var copyFile = function (srcpath, destpath) {
+    var destdir = path.dirname(destpath);
     var contents = fs.readFileSync(srcpath);
+    mkdir(destdir);
     fs.writeFileSync(destpath, contents);
+};
+
+
+// 创建目录，包括子文件夹
+function mkdir (dir) {
+
+    var currPath = dir;
+    var toMakeUpPath = [];
+
+    while (!fs.existsSync(currPath)) {
+        toMakeUpPath.unshift(currPath);
+        currPath = path.dirname(currPath);
+    }
+
+    toMakeUpPath.forEach(function (pathItem) {
+        fs.mkdirSync(pathItem);
+    });
 };
 
 
@@ -23,7 +48,7 @@ var FontSpider = function (src, options) {
 
     if (typeof src === 'string') {
         src = glob.sync(src);
-    } else {
+    } else if( Array.isArray(src) ) {
         var srcs = [];
         src.forEach(function (item) {
             srcs = srcs.concat(glob.sync(item));
@@ -32,58 +57,49 @@ var FontSpider = function (src, options) {
     }
 
     options = options || {};
-    Object.keys(FontSpider.defaults).forEach(function (key) {
+    for (var key in FontSpider.defaults) {
         if (options[key] === undefined) {
             options[key] = FontSpider.defaults[key];
         }
-    });
+    }
 
     this.src = src;
     this.options = options;
+
+    new ColorConsole(options).mix(this);
+
+    return this._start();
 };
 
 
-FontSpider.BACKUP_EXTNAME = '.backup';
-FontSpider.defaults = {
-    debug: false,
-    silent: false,
-    backup: true,
-    ignore: [],
-    map: []
-};
-
+FontSpider.Font = Font;
+FontSpider.Spider = Spider;
+FontSpider.defaults = Object.create(Spider.defaults);
+FontSpider.defaults.backup = true;
 
 
 FontSpider.prototype = {
 
     constructor: FontSpider,
 
-    onoutput: function (data) {},
-    onerror: function (data) {},
-    onend: function (data) {},
 
-
-    start: function () {
+    _start: function () {
 
         var that = this;
         var src = this.src;
         var options = this.options;
         var backup = options.backup !== false;
 
-        var BACKUP_EXTNAME = FontSpider.BACKUP_EXTNAME;
-
-
-        new Spider(src, options, function (error, data) {
-
-            if (error) {
-                that.onerror(error);
-                return;
-            }
+        return new Spider(src, options)
+        .then(function (data) {
 
             var result = [];
 
             data.forEach(function (item) {
 
+                
+                var error;
+                var source;
                 var chars = item.chars;
 
 
@@ -92,42 +108,17 @@ FontSpider.prototype = {
                     return;
                 }
 
-
                 // 找到 .ttf 的字体文件
-                var src, dest;
                 item.files.forEach(function (file) {
                     var extname = path.extname(file).toLocaleLowerCase();
-                    
-                    if (error) {
-                        return;
+
+                    if (RE_SERVER.test(file)) {
+                        error = 'does not support the absolute path "' + file + '"';
+                        that.error('[ERROR]', error);
+                    } else if (extname === '.ttf') {
+                        source = file;
                     }
 
-                    if (extname !== '.ttf') {
-                        return;
-                    }
-
-                    if (fs.existsSync(file)) { 
-                        
-                        if (backup && fs.existsSync(file + BACKUP_EXTNAME)) {
-                            // 使用备份的字体
-                            src = file + BACKUP_EXTNAME;
-                        } else {
-                            src = file;
-                            // 备份字体，这样可以反复处理
-                            backup && copyFile(src, src + BACKUP_EXTNAME);
-                        }
-
-                        dest = file;
-                    } else {
-
-                        error = {
-                            code: 1,
-                            message: '"' + file + '" file not found'
-                        };
-                        that.onerror(error);
-                    }
-                    
-                    
                 });
 
 
@@ -136,94 +127,87 @@ FontSpider.prototype = {
                 }
 
 
-                if (!src) {
-                    error = {
-                        code: 2,
-                        message: '"' + item.name  + '"' + ' did not find tureType fonts'
-                    };
-                    that.onerror(error);
+                if (!source) {
+                    error = '"' + item.name  + '"' + ' did not find turetype fonts';
+                    that.error('[ERROR]', error);
                     return;
                 }
 
 
-                dest = dest || src;
-                var dirname = path.dirname(dest);
-                var extname = path.extname(dest);
-                var basename = path.basename(dest, extname);
-                var out = path.join(dirname, basename);
-                var stat = fs.statSync(src);
 
-                
+                var dirname = path.dirname(source);
+                var basename = path.basename(source);
+                var extname = path.extname(source);
+                var backupFile;
 
-                var optimizer = new Optimizer(src);
-                var optimizerResult = optimizer.minify(dest, chars);
-                
 
-                if (optimizerResult.code !== 0) {
+                // 备份字体
+                if (backup) {
 
-                    if (optimizerResult.code === Optimizer.COMMAND_NOT_FOUND) {
-                        error = {
-                            code: 3,
-                            message: 'Please install perl. See: http://www.perl.org'
-                        };
+                    // version < 0.2.1
+                    if (fs.existsSync(source + '.backup')) {
+                        backupFile = source + '.backup';
                     } else {
-                        error = {
-                            code: 4,
-                            message: 'Optimizer error.\n' + src,
-                            result: optimizerResult.output
-                        };
+                        backupFile = dirname + '/.font-spider/' + basename;
                     }
 
-                    that.onerror(error);
+                    if (fs.existsSync(backupFile)) {
+                        copyFile(backupFile, source);
+                    } else {
+                        copyFile(source, backupFile);
+                    }
 
+                }
+
+
+
+                if (!fs.existsSync(source)) {
+                    error = '"' + source + '" file not found';
+                    that.error('[ERROR]', error);
                     return;
                 }
 
-                var info = {
-                    fontName: item.name,
-                    includeChars: chars,
-                    originalSize: stat.size,
-                    output: [{
-                        file: path.relative('./', dest),
-                        size: fs.statSync(dest).size
-                    }]
-                };
 
-                var convertor = new Convertor(dest);
+
+                var stat = fs.statSync(source);
+                var destConfig = {};
+
 
                 item.files.forEach(function (file) {
-                    
+
                     var extname = path.extname(file).toLocaleLowerCase();
                     var type = extname.replace('.', '');
 
-                    if (type === 'ttf') {
-                        return;
-                    }
-                    
-                    if (typeof convertor[type] === 'function') {
-                        convertor[type](file);
+                    destConfig[type] = file;
 
-                        info.output.push({
-                            file: path.relative('./', file),
-                            size: fs.statSync(file).size
-                        });
-
-                    } else {
-                        console.warn('File ' + path.relative('./', file) + ' not created')
-                    }
-                    
                 });
 
+                result.push(new Font(source, {
+                    dest: destConfig,
+                    chars: chars
+                }).then(function () {
 
-                result.push(info);
-                that.onoutput(info);
+                    that.info('Font name:', '(' + item.name + ')');
+                    that.info('Original size:', '<' + stat.size / 100 + ' KB>');
+                    that.info('Include chars:', chars);
+
+                    item.files.forEach(function (file) {
+                        if (fs.existsSync(file)) {
+                            that.info('File', '(' + path.relative('./', file) + ')',
+                                'created:', '<' + fs.statSync(file).size / 1000 + ' KB>');    
+                        }
+                    });
+
+                    that.info('');
+
+                }));
 
             });
 
-            
-            that.onend(result);
-
-
+            return Promise.all(result);
+        })
+        .then(null, function (errors) {
+            that.error('[ERROR]', errors && errors.stack || errors);
         });
 
     }
